@@ -73,8 +73,9 @@ object Main extends App {
   }
 
   //getting the sample from the algorithm.
-  private val sampleSize = 100_000  // initial value, perhaps it can be changed later.
-  private val iter = taxiDF.toLocalIterator().asScala //before we call our samplingMethod we gather all data on the driver node
+  //100_000  initial value, perhaps it can be changed later.
+  private val sampleSize = 100_000
+  private val iter = taxiDF.limit(10000000).toLocalIterator().asScala //before we call our samplingMethod we gather all data on the driver node
   private val sampledRows = reservoirSample(iter, sampleSize) //we then do the sampling
   private val sampleRDD = spark.sparkContext.parallelize(sampledRows.toList) //then redistribute the data again.
   private val sampleDF = spark.createDataFrame(sampleRDD, taxiDF.schema) //our sample dataframe is ready
@@ -82,46 +83,159 @@ object Main extends App {
 
   println(s"Sample size: ${sampleDF.count()} rows")
 
-  //Query1: Peak Hour Tipping Behavior – Compute average tips per passenger by hour.
+//  //Query1: Peak Hour Tipping Behavior – Compute average tips per passenger by hour.
+//
+//  //No sample
+//  val start = System.nanoTime()
+//
+//  private val query1DF = taxiDF
+//    .filter(col("passenger_count") > 0)
+//    .filter(col("tip_amount") >= 0)
+//    .withColumn("tip_per_passenger", col("tip_amount") / col("passenger_count"))
+//    .groupBy("hour")
+//    .agg(
+//      round(avg("tip_per_passenger"), 2).alias("avg_tip_per_passenger"),
+//      count("*").alias("trip_count")
+//    )
+//    .orderBy("hour")
+//
+//  val end = System.nanoTime()
+//
+//  private val durationSeconds = (end - start) / 1e9d
+//  // Show the results
+//  query1DF.show()
+//  println(f"Query 1 executed in $durationSeconds%.2f seconds")
+//
+//  //With sample
+//  private val startSample = System.nanoTime()
+//  private val query1SampleDF = sampleDF
+//    .filter(col("tip_amount") >= 0)
+//    .withColumn("tip_per_passenger", col("tip_amount") / col("passenger_count"))
+//    .groupBy("hour")
+//    .agg(
+//      round(avg("tip_per_passenger"), 2).alias("avg_tip_per_passenger"),
+//      count("*").alias("trip_count")
+//    )
+//    .orderBy("hour")
+//  private val endSample = System.nanoTime()
+//  private val timeSample = (endSample - startSample) / 1e9
+//
+//  query1SampleDF.show()
+//  println(f"Query 1 (Sample) executed in $timeSample%.2f seconds")
+//
+//  //END OF QUERY 1
 
+  //Query2: Top Revenue Pickup Zones – Identify zones with the highest average fare.
   //No sample
-  val start = System.nanoTime()
+//  private val start2 = System.nanoTime()
+//  private val query2DF = taxiDF
+//    .filter(col("fare_amount").isNotNull && col("fare_amount") > 0)
+//    .groupBy("PULocationID")
+//    .agg(
+//      round(avg("fare_amount"), 2).alias("avg_fare_amount"),
+//      count("*").alias("trip_count")
+//    )
+//    .orderBy(desc("avg_fare_amount"))
+//    .limit(10)
+//  private val end2 = System.nanoTime()
+//  private val duration2 = (end2 - start2) / 1e9d
+//  query2DF.show(false)
+//  println(f"Query 2 executed in $duration2%.2f seconds")
+//
+//  //With sample
+//  private val start2Sample = System.nanoTime()
+//  private val query2SampleDF = sampleDF
+//    .filter(col("fare_amount").isNotNull && col("fare_amount") > 0)
+//    .groupBy("PULocationID")
+//    .agg(
+//      round(avg("fare_amount"), 2).alias("avg_fare_amount"),
+//      count("*").alias("trip_count")
+//    )
+//    .orderBy(desc("avg_fare_amount"))
+//    .limit(10)
+//  private val end2Sample = System.nanoTime()
+//  private val duration2Sample = (end2Sample - start2Sample) / 1e9d
+//  query2SampleDF.show(false)
+//  println(f"Query 2 (Sample) executed in $duration2Sample%.2f seconds")
 
-  private val query1DF = taxiDF
-    .filter(col("passenger_count") > 0)
-    .filter(col("tip_amount") >= 0)
-    .withColumn("tip_per_passenger", col("tip_amount") / col("passenger_count"))
-    .groupBy("hour")
-    .agg(
-      round(avg("tip_per_passenger"), 2).alias("avg_tip_per_passenger"),
-      count("*").alias("trip_count")
+
+
+  //Query3: Multidimensional Skyline – Find trips not dominated in tip, fare, and distance.
+  //No sample
+  private val startSkyline = System.nanoTime()
+
+  private val taxiStats = taxiDF
+    .filter(
+      col("tip_amount").isNotNull &&
+        col("fare_amount").isNotNull &&
+        col("trip_distance").isNotNull &&
+        col("tip_amount") >= 0 &&
+        col("fare_amount") >= 0 &&
+        col("trip_distance") >= 0
     )
-    .orderBy("hour")
+    .limit(10000000)
+    .select("tip_amount", "fare_amount", "trip_distance")
 
-  val end = System.nanoTime()
+  private val statsA = taxiStats.alias("a")
+  private val statsB = taxiStats.alias("b")
 
-  private val durationSeconds = (end - start) / 1e9d
-  // Show the results
-  query1DF.show()
-  println(f"Query 1 executed in $durationSeconds%.2f seconds")
+  private val dominationCondition =
+    (col("b.tip_amount") >= col("a.tip_amount")) &&
+      (col("b.fare_amount") >= col("a.fare_amount")) &&
+      (col("b.trip_distance") >= col("a.trip_distance")) &&
+      (
+        col("b.tip_amount") > col("a.tip_amount") ||
+          col("b.fare_amount") > col("a.fare_amount") ||
+          col("b.trip_distance") > col("a.trip_distance")
+        )
 
-  //With Sample
-  private val startSample = System.nanoTime()
-  private val query1SampleDF = sampleDF
-    .filter(col("tip_amount") >= 0)
-    .withColumn("tip_per_passenger", col("tip_amount") / col("passenger_count"))
-    .groupBy("hour")
-    .agg(
-      round(avg("tip_per_passenger"), 2).alias("avg_tip_per_passenger"),
-      count("*").alias("trip_count")
+  private val skylineFullDF = statsA.join(statsB, dominationCondition, "left_anti")
+
+  private val endSkyline = System.nanoTime()
+  private val durationSkyline = (endSkyline - startSkyline) / 1e9d
+
+  skylineFullDF.show(truncate = false)
+  println(f"Query 3 (Skyline - Full Data) executed in $durationSkyline%.2f seconds")
+  println(s"Skyline size (full data): ${skylineFullDF.count()} rows")
+
+
+  //With sample
+  private val startSkylineSample = System.nanoTime()
+
+  private val sampleStats = sampleDF
+    .filter(
+      col("tip_amount").isNotNull &&
+        col("fare_amount").isNotNull &&
+        col("trip_distance").isNotNull &&
+        col("tip_amount") >= 0 &&
+        col("fare_amount") >= 0 &&
+        col("trip_distance") >= 0
     )
-    .orderBy("hour")
-  private val endSample = System.nanoTime()
-  private val timeSample = (endSample - startSample) / 1e9
+    .select("tip_amount", "fare_amount", "trip_distance")
 
-  query1SampleDF.show()
-  println(f"Query 1 (Sample) executed in $timeSample%.2f seconds")
+  private val sampleA = sampleStats.alias("a")
+  private val sampleB = sampleStats.alias("b")
+
+  private val dominationSampleCondition =
+    (col("b.tip_amount") >= col("a.tip_amount")) &&
+      (col("b.fare_amount") >= col("a.fare_amount")) &&
+      (col("b.trip_distance") >= col("a.trip_distance")) &&
+      (
+        col("b.tip_amount") > col("a.tip_amount") ||
+          col("b.fare_amount") > col("a.fare_amount") ||
+          col("b.trip_distance") > col("a.trip_distance")
+        )
+
+  private val skylineSampleDF = sampleA.join(sampleB, dominationSampleCondition, "left_anti")
+
+  private val endSkylineSample = System.nanoTime()
+  private val durationSkylineSample = (endSkylineSample - startSkylineSample) / 1e9d
+
+  skylineSampleDF.show(truncate = false)
+  println(f"Query 3 (Skyline - Sample) executed in $durationSkylineSample%.2f seconds")
+  println(s"Skyline size (sample): ${skylineSampleDF.count()} rows")
+
 
   spark.stop()
-  
+
 }
