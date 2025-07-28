@@ -250,44 +250,84 @@ object Main extends App {
 
   //Query4: Congestion Surcharge Trends – Analyze total congestion fees per month.
   //No sample
-  private val startQ4Full = System.nanoTime()
+//  private val startQ4Full = System.nanoTime()
+//
+//  private val query4FullDF = taxiDF
+//    .withColumn("year", year(col("pickup_datetime")))
+//    .withColumn("month", month(col("pickup_datetime")))
+//    .groupBy("year", "month")
+//    .agg(
+//      round(sum("congestion_surcharge"), 2).alias("total_congestion_surcharge"),
+//      count("*").alias("trip_count")
+//    )
+//    .orderBy("year", "month")
+//
+//  private val endQ4Full = System.nanoTime()
+//  private val durationFull = (endQ4Full - startQ4Full) / 1e9
+//
+//  query4FullDF.show(50, truncate = false)
+//  println(f"Query 4 (Full Data) executed in $durationFull%.2f seconds")
+//
+//  //With sample
+//  private val startQ4Sample = System.nanoTime()
+//
+//  private val query4SampleDF = sampleDF
+//    .withColumn("year", year(col("pickup_datetime")))
+//    .withColumn("month", month(col("pickup_datetime")))
+//    .groupBy("year", "month")
+//    .agg(
+//      round(sum("congestion_surcharge"), 2).alias("total_congestion_surcharge"),
+//      count("*").alias("trip_count")
+//    )
+//    .orderBy("year", "month")
+//
+//  private val endQ4Sample = System.nanoTime()
+//  private val durationSample = (endQ4Sample - startQ4Sample) / 1e9
+//
+//  query4SampleDF.show(50, truncate = false)
+//  println(f"Query 4 (Sample Data) executed in $durationSample%.2f seconds")
 
-  private val query4FullDF = taxiDF
-    .withColumn("year", year(col("pickup_datetime")))
-    .withColumn("month", month(col("pickup_datetime")))
-    .groupBy("year", "month")
-    .agg(
-      round(sum("congestion_surcharge"), 2).alias("total_congestion_surcharge"),
-      count("*").alias("trip_count")
-    )
-    .orderBy("year", "month")
+  //
 
-  private val endQ4Full = System.nanoTime()
-  private val durationFull = (endQ4Full - startQ4Full) / 1e9
+  // Query5: Display the top 50 weekday morning dropoff locations
+  // No sample version
+  private val startQ5 = System.nanoTime()
 
-  query4FullDF.show(50, truncate = false)
-  println(f"Query 4 (Full Data) executed in $durationFull%.2f seconds")
+  private val query5FullDF = taxiDF
+    .withColumn("hour", hour(col("dropoff_datetime")))
+    .withColumn("day_of_week", expr("extract(DOW from dropoff_datetime) + 1")) // 1=Monday, ..., 7=Sunday
+    .filter(col("hour").between(6, 11))
+    .filter(col("day_of_week").between(1, 5)) // Weekdays only
+    .filter(col("DOLocationID").isNotNull)
+    .groupBy("DOLocationID", "hour")
+    .agg(count("*").alias("dropoff_count"))
+    .orderBy(desc("dropoff_count"))
+    .limit(50)
 
-  //With sample
-  private val startQ4Sample = System.nanoTime()
+  private val endQ5 = System.nanoTime()
+  private val durationQ5 = (endQ5 - startQ5) / 1e9
+  query5FullDF.show(false)
+  println(f"Query 5 (Weekday Morning Drop-Offs - Full Data) executed in $durationQ5%.2f seconds")
 
-  private val query4SampleDF = sampleDF
-    .withColumn("year", year(col("pickup_datetime")))
-    .withColumn("month", month(col("pickup_datetime")))
-    .groupBy("year", "month")
-    .agg(
-      round(sum("congestion_surcharge"), 2).alias("total_congestion_surcharge"),
-      count("*").alias("trip_count")
-    )
-    .orderBy("year", "month")
+  //with sample
+  private val startQ5Sample = System.nanoTime()
 
-  private val endQ4Sample = System.nanoTime()
-  private val durationSample = (endQ4Sample - startQ4Sample) / 1e9
+  private val query5SampleDF = sampleDF
+    .withColumn("hour", hour(col("dropoff_datetime")))
+    .withColumn("day_of_week", expr("extract(DOW from dropoff_datetime) + 1")) // 1=Monday, ..., 7=Sunday
+    .filter(col("hour").between(6, 11))
+    .filter(col("day_of_week").between(1, 5))
+    .filter(col("DOLocationID").isNotNull)
+    .groupBy("DOLocationID", "hour")
+    .agg(count("*").alias("dropoff_count"))
+    .orderBy(desc("dropoff_count"))
+    .limit(50)
 
-  query4SampleDF.show(50, truncate = false)
-  println(f"Query 4 (Sample Data) executed in $durationSample%.2f seconds")
+  private val endQ5Sample = System.nanoTime()
+  private val durationQ5Sample = (endQ5Sample - startQ5Sample) / 1e9
+  query5SampleDF.show(false)
+  println(f"Query 5 (Weekday Morning Drop-Offs - Sample Data) executed in $durationQ5Sample%.2f seconds")
 
 
   spark.stop()
-
 }
