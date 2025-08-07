@@ -1,10 +1,8 @@
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
-
-import scala.jdk.CollectionConverters.IteratorHasAsScala
-import scala.util.Random
-import scala.reflect.ClassTag
+import org.apache.spark.util.sketch.CountMinSketch
 
 object Main extends App {
 
@@ -13,10 +11,12 @@ object Main extends App {
     .appName("NYC Taxi Analyzer")
     .getOrCreate()
 
-  //data for 2021-2023 period. (9 gb)
+  spark.sparkContext.setLogLevel("WARN") // Reduces console noise
+
+  // Data for 2021-2023 period (9 GB)
   private val taxiRawDataPath = "hdfs://localhost:9000/taxi_data/yellow_taxi_combined_2021_2023.csv"
 
-  //defining the schema to properly access the data in the csv file.
+  // Defining the schema to properly access the data in the CSV file
   val schema = StructType(Array(
     StructField("VendorID", StringType, nullable = true),
     StructField("tpep_pickup_datetime", StringType, nullable = true),
@@ -39,295 +39,246 @@ object Main extends App {
     StructField("airport_fee", DoubleType, nullable = true)
   ))
 
-//  private val taxiDF = spark.read
-//    .option("header", "true")
-//    .schema(schema)
-//    .csv(taxiRawDataPath)
-//    .withColumn("pickup_datetime", to_timestamp(col("tpep_pickup_datetime")))
-//    .withColumn("dropoff_datetime", to_timestamp(col("tpep_dropoff_datetime")))
-//    .withColumn("hour", hour(col("pickup_datetime")))
-//    .filter(col("passenger_count") > 0)  //filtering some invalid cases.
-  //    .filter(col("tip_amount") >= 0)
-
+  // --- Data Loading and Preparation ---
   private val taxiDF = spark.read
     .option("header", "true")
     .schema(schema)
     .csv(taxiRawDataPath)
     .withColumn("pickup_datetime", to_timestamp(col("tpep_pickup_datetime")))
     .withColumn("dropoff_datetime", to_timestamp(col("tpep_dropoff_datetime")))
-    .withColumn("hour", hour(col("pickup_datetime")))
     .filter(col("passenger_count") > 0)
+    .filter(col("PULocationID").isNotNull && col("DOLocationID").isNotNull)
     .filter(
       col("pickup_datetime").between("2021-01-01", "2023-12-31")
     )
+    .limit(35000000)
+    .cache() // Cache the base DataFrame for performance
 
-  println(s"Total rows: ${taxiDF.count()}")
+  val totalRows = taxiDF.count()
+  println(s"Total rows in DataFrame: $totalRows")
 
-  //taxiDF.limit(10).show(truncate = false)
+  // --- Synopsis Creation ---
 
-  //we're going to use Algorithm R to get our sample.
-  private def reservoirSample[T: ClassTag](input: Iterator[T], k: Int): Array[T] = {
-    val reservoir = new Array[T](k)
-    val random = new Random()
+  // 1. Reservoir Sampling (using Spark's built-in distributed method)
+  println("\n--- Creating Reservoir Sample ---")
+  private val sampleFraction = 100000.0 / totalRows // approx. 100k rows
+  private val sampleDF = taxiDF.sample(withReplacement = false, fraction = sampleFraction, seed = 1234L).cache()
+  val sampleSize = sampleDF.count()
+  println(s"Reservoir Sample size: $sampleSize rows")
 
-    for ((elem, i) <- input.zipWithIndex) {
-      if (i < k) {
-        reservoir(i) = elem
-      } else {
-        val j = random.nextInt(i + 1)
-        if (j < k) {
-          reservoir(j) = elem
-        }
-      }
-    }
 
-    reservoir
+  // 2. Count-Min Sketch
+  println("\n--- Creating Count-Min Sketches ---")
+  // Parameters for the sketch. ε (relative error), δ (confidence)
+  val eps = 0.0001
+  val confidence = 0.95
+  val seed = 1
+
+  // Create and populate a sketch for PULocationID
+  val cmsPuLocation = CountMinSketch.create(eps, confidence, seed)
+  val puLocationData = taxiDF.select("PULocationID").collect().map(_.getString(0))
+  puLocationData.foreach(loc => cmsPuLocation.add(loc))
+  println("Count-Min Sketch for PULocationID created.")
+
+  // Create and populate a sketch for passenger_count
+  val cmsPassengerCount = CountMinSketch.create(eps, confidence, seed)
+  val passengerCountData = taxiDF.select("passenger_count").collect().map(row => row.getDouble(0).toLong)
+  passengerCountData.foreach(pc => cmsPassengerCount.add(pc))
+  println("Count-Min Sketch for passenger_count created.")
+
+
+  // --- Helper Function for Displaying Results ---
+  def runAndDisplay(queryName: String, queryFunction: () => Unit): Unit = {
+    println(s"\n================== RUNNING $queryName ==================")
+    val startTime = System.nanoTime()
+    queryFunction()
+    val duration = (System.nanoTime() - startTime) / 1e9d
+    println(f"Total time for $queryName: $duration%.2f seconds")
+    println(s"========================================================\n")
   }
 
-  //getting the sample from the algorithm.
-  //100_000  initial value, perhaps it can be changed later.
-  //The limit on iter was put due to Q3 being too heavy.
-  private val sampleSize = 100_000
-  private val iter = taxiDF/*.limit(10000000)*/.toLocalIterator().asScala //before we call our samplingMethod we gather all data on the driver node
-  private val sampledRows = reservoirSample(iter, sampleSize) //we then do the sampling
-  private val sampleRDD = spark.sparkContext.parallelize(sampledRows.toList) //then redistribute the data again.
-  private val sampleDF = spark.createDataFrame(sampleRDD, taxiDF.schema) //our sample dataframe is ready
+  // =================================================================================
+  // QUERY 1: Top 20 Busiest Pickup Locations (Modified from your original Query 2)
+  // =================================================================================
+  runAndDisplay("Query 1: Top 20 Busiest Pickup Locations", () => {
+    // A. Exact Calculation
+    println("--- A. Exact Calculation (Full Data) ---")
+    val exactTopPuDF = taxiDF
+      .groupBy("PULocationID")
+      .agg(count("*").alias("exact_trip_count"))
+      .orderBy(desc("exact_trip_count"))
+      .limit(20)
+    exactTopPuDF.show(false)
+
+    // B. Reservoir Sample Estimate
+    println("--- B. Reservoir Sample Estimate ---")
+    val scalingFactor = totalRows.toDouble / sampleSize
+    val sampledTopPuDF = sampleDF
+      .groupBy("PULocationID")
+      .agg(round(count("*") * scalingFactor).alias("sampled_trip_count"))
+      .orderBy(desc("sampled_trip_count"))
+      .limit(20)
+    sampledTopPuDF.show(false)
+
+    // C. Count-Min Sketch Estimate
+    println("--- C. Count-Min Sketch Estimate ---")
+    val topPuLocations = exactTopPuDF.select("PULocationID").collect().map(_.getString(0))
+    val cmsPuEstimates = topPuLocations.map(loc => (loc, cmsPuLocation.estimateCount(loc)))
+    val cmsPuDF = spark.createDataFrame(cmsPuEstimates).toDF("PULocationID", "cms_estimated_count")
+    cmsPuDF.show(false)
+  })
+
+  // =================================================================================
+  // QUERY 2: Top 50 Weekday Morning Dropoffs (Your original Query 5)
+  // =================================================================================
+  runAndDisplay("Query 2: Top 50 Weekday Morning Dropoffs", () => {
+    // A. Exact Calculation
+    println("--- A. Exact Calculation (Full Data) ---")
+    val query5FullDF = taxiDF
+      .withColumn("hour", hour(col("dropoff_datetime")))
+      .withColumn("day_of_week", dayofweek(col("dropoff_datetime"))) // 1=Sun, 2=Mon...
+      .filter(col("hour").between(6, 11))
+      .filter(col("day_of_week").between(2, 6)) // Weekdays only
+      .groupBy("DOLocationID", "hour")
+      .agg(count("*").alias("exact_dropoff_count"))
+      .orderBy(desc("exact_dropoff_count"))
+      .limit(50)
+    query5FullDF.show(50, false)
+
+    // B. Reservoir Sample Estimate
+    println("--- B. Reservoir Sample Estimate ---")
+    val scalingFactor = totalRows.toDouble / sampleSize
+    val query5SampleDF = sampleDF
+      .withColumn("hour", hour(col("dropoff_datetime")))
+      .withColumn("day_of_week", dayofweek(col("dropoff_datetime")))
+      .filter(col("hour").between(6, 11))
+      .filter(col("day_of_week").between(2, 6))
+      .groupBy("DOLocationID", "hour")
+      .agg(round(count("*") * scalingFactor).alias("sampled_dropoff_count"))
+      .orderBy(desc("sampled_dropoff_count"))
+      .limit(50)
+    query5SampleDF.show(50, false)
+
+    // C. Count-Min Sketch (Note: Sketching on a composite key is more complex, so we'll just show the concept on the single-key from Q1)
+    println("--- C. Count-Min Sketch Estimate ---")
+    println("NOTE: Count-Min is best for single keys. For this query, we'll re-use the Pickup sketch to demonstrate the principle.")
+    val topDoLocations = query5FullDF.select("DOLocationID").distinct.limit(20).collect().map(_.getString(0))
+    val cmsDoEstimates = topDoLocations.map(loc => (loc, cmsPuLocation.estimateCount(loc))) // Re-using PU sketch for demo
+    val cmsDoDF = spark.createDataFrame(cmsDoEstimates).toDF("DOLocationID", "cms_estimated_count (approx)")
+    cmsDoDF.show(false)
+
+  })
+
+  // =================================================================================
+  // QUERY 3: Busiest Taxi Routes (Pickup-Dropoff Pair)
+  // =================================================================================
+  runAndDisplay("Query 3: Busiest Taxi Routes", () => {
+    // A. Exact Calculation
+    println("--- A. Exact Calculation (Full Data) ---")
+    val busiestRoutesDF = taxiDF
+      .groupBy("PULocationID", "DOLocationID")
+      .agg(count("*").alias("exact_trip_count"))
+      .orderBy(desc("exact_trip_count"))
+      .limit(20)
+    busiestRoutesDF.show(false)
+
+    // B. Reservoir Sample Estimate
+    println("--- B. Reservoir Sample Estimate ---")
+    val scalingFactor = totalRows.toDouble / sampleSize
+    val sampledRoutesDF = sampleDF
+      .groupBy("PULocationID", "DOLocationID")
+      .agg(round(count("*") * scalingFactor).alias("sampled_trip_count"))
+      .orderBy(desc("sampled_trip_count"))
+      .limit(20)
+    sampledRoutesDF.show(false)
+
+    // C. Count-Min Sketch (Composite key needs to be concatenated into a string)
+    println("--- C. Count-Min Sketch Estimate ---")
+    val cmsRoutes = CountMinSketch.create(eps, confidence, seed)
+    val routeData = taxiDF.select(concat_ws("_", col("PULocationID"), col("DOLocationID")).as("route")).collect().map(_.getString(0))
+    routeData.foreach(route => cmsRoutes.add(route))
+    println("Count-Min Sketch for routes created.")
+
+    val topRoutes = busiestRoutesDF.select(concat_ws("_", col("PULocationID"), col("DOLocationID")).as("route")).collect().map(_.getString(0))
+    val cmsRouteEstimates = topRoutes.map(route => (route, cmsRoutes.estimateCount(route)))
+    val cmsRoutesDF = spark.createDataFrame(cmsRouteEstimates).toDF("Route", "cms_estimated_count")
+    cmsRoutesDF.show(false)
+  })
 
 
-  println(s"Sample size: ${sampleDF.count()} rows")
+  // =================================================================================
+  // QUERY 4: Passenger Count Distribution
+  // =================================================================================
+  runAndDisplay("Query 4: Passenger Count Distribution", () => {
+    // A. Exact Calculation
+    println("--- A. Exact Calculation (Full Data) ---")
+    val passengerCountDF = taxiDF
+      .filter(col("passenger_count").isNotNull && col("passenger_count").between(1, 8))
+      .groupBy("passenger_count")
+      .agg(count("*").alias("exact_trip_count"))
+      .orderBy("passenger_count")
+    passengerCountDF.show()
 
-//  //Query1: Peak Hour Tipping Behavior – Compute average tips per passenger by hour.
-//
-//  //No sample
-//  val start = System.nanoTime()
-//
-//  private val query1DF = taxiDF
-//    .filter(col("passenger_count") > 0)
-//    .filter(col("tip_amount") >= 0)
-//    .withColumn("tip_per_passenger", col("tip_amount") / col("passenger_count"))
-//    .groupBy("hour")
-//    .agg(
-//      round(avg("tip_per_passenger"), 2).alias("avg_tip_per_passenger"),
-//      count("*").alias("trip_count")
-//    )
-//    .orderBy("hour")
-//
-//  val end = System.nanoTime()
-//
-//  private val durationSeconds = (end - start) / 1e9d
-//  // Show the results
-//  query1DF.show()
-//  println(f"Query 1 executed in $durationSeconds%.2f seconds")
-//
-//  //With sample
-//  private val startSample = System.nanoTime()
-//  private val query1SampleDF = sampleDF
-//    .filter(col("tip_amount") >= 0)
-//    .withColumn("tip_per_passenger", col("tip_amount") / col("passenger_count"))
-//    .groupBy("hour")
-//    .agg(
-//      round(avg("tip_per_passenger"), 2).alias("avg_tip_per_passenger"),
-//      count("*").alias("trip_count")
-//    )
-//    .orderBy("hour")
-//  private val endSample = System.nanoTime()
-//  private val timeSample = (endSample - startSample) / 1e9
-//
-//  query1SampleDF.show()
-//  println(f"Query 1 (Sample) executed in $timeSample%.2f seconds")
-//
-//  //END OF QUERY 1
+    // B. Reservoir Sample Estimate
+    println("--- B. Reservoir Sample Estimate ---")
+    val scalingFactor = totalRows.toDouble / sampleSize
+    val sampledPassengerCountDF = sampleDF
+      .filter(col("passenger_count").isNotNull && col("passenger_count").between(1, 8))
+      .groupBy("passenger_count")
+      .agg(round(count("*") * scalingFactor).alias("sampled_trip_count"))
+      .orderBy("passenger_count")
+    sampledPassengerCountDF.show()
 
-  //Query2: Top Revenue Pickup Zones – Identify zones with the highest average fare.
-  //No sample
-//  private val start2 = System.nanoTime()
-//  private val query2DF = taxiDF
-//    .filter(col("fare_amount").isNotNull && col("fare_amount") > 0)
-//    .groupBy("PULocationID")
-//    .agg(
-//      round(avg("fare_amount"), 2).alias("avg_fare_amount"),
-//      count("*").alias("trip_count")
-//    )
-//    .orderBy(desc("avg_fare_amount"))
-//    .limit(10)
-//  private val end2 = System.nanoTime()
-//  private val duration2 = (end2 - start2) / 1e9d
-//  query2DF.show(false)
-//  println(f"Query 2 executed in $duration2%.2f seconds")
-//
-//  //With sample
-//  private val start2Sample = System.nanoTime()
-//  private val query2SampleDF = sampleDF
-//    .filter(col("fare_amount").isNotNull && col("fare_amount") > 0)
-//    .groupBy("PULocationID")
-//    .agg(
-//      round(avg("fare_amount"), 2).alias("avg_fare_amount"),
-//      count("*").alias("trip_count")
-//    )
-//    .orderBy(desc("avg_fare_amount"))
-//    .limit(10)
-//  private val end2Sample = System.nanoTime()
-//  private val duration2Sample = (end2Sample - start2Sample) / 1e9d
-//  query2SampleDF.show(false)
-//  println(f"Query 2 (Sample) executed in $duration2Sample%.2f seconds")
+    // C. Count-Min Sketch Estimate
+    println("--- C. Count-Min Sketch Estimate ---")
+    val passengerCounts = passengerCountDF.select("passenger_count").collect().map(row => row.getDouble(0).toLong)
+    val cmsPassengerEstimates = passengerCounts.map(pc => (pc, cmsPassengerCount.estimateCount(pc)))
+    val cmsPassengerDF = spark.createDataFrame(cmsPassengerEstimates).toDF("passenger_count", "cms_estimated_count")
+    cmsPassengerDF.show()
+  })
 
 
+  // =================================================================================
+  // QUERY 5: Payment Type Analysis
+  // =================================================================================
+  runAndDisplay("Query 5: Payment Type Analysis", () => {
+    // A. Exact Calculation
+    println("--- A. Exact Calculation (Full Data) ---")
+    // Let's create a more readable mapping for payment_type
+    val paymentTypeMapping = Map("1" -> "Credit card", "2" -> "Cash", "3" -> "No charge", "4" -> "Dispute", "5" -> "Unknown", "6" -> "Voided trip")
+    val toPaymentType = udf((id: String) => paymentTypeMapping.getOrElse(id, "Other"))
 
-  //Query3: Multidimensional Skyline – Find trips not dominated in tip, fare, and distance.
-  //No sample
-//  private val startSkyline = System.nanoTime()
-//
-//  private val taxiStats = taxiDF
-//    .filter(
-//      col("tip_amount").isNotNull &&
-//        col("fare_amount").isNotNull &&
-//        col("trip_distance").isNotNull &&
-//        col("tip_amount") >= 0 &&
-//        col("fare_amount") >= 0 &&
-//        col("trip_distance") >= 0
-//    )
-//    //.limit(10000000)
-//    .select("tip_amount", "fare_amount", "trip_distance")
-//
-//  private val statsA = taxiStats.alias("a")
-//  private val statsB = taxiStats.alias("b")
-//
-//  private val dominationCondition =
-//    (col("b.tip_amount") >= col("a.tip_amount")) &&
-//      (col("b.fare_amount") >= col("a.fare_amount")) &&
-//      (col("b.trip_distance") >= col("a.trip_distance")) &&
-//      (
-//        col("b.tip_amount") > col("a.tip_amount") ||
-//          col("b.fare_amount") > col("a.fare_amount") ||
-//          col("b.trip_distance") > col("a.trip_distance")
-//        )
-//
-//  private val skylineFullDF = statsA.join(statsB, dominationCondition, "left_anti")
-//
-//  private val endSkyline = System.nanoTime()
-//  private val durationSkyline = (endSkyline - startSkyline) / 1e9d
-//
-//  skylineFullDF.show(truncate = false)
-//  println(f"Query 3 (Skyline - Full Data) executed in $durationSkyline%.2f seconds")
-//  println(s"Skyline size (full data): ${skylineFullDF.count()} rows")
-//
-//
-//  //With sample
-//  private val startSkylineSample = System.nanoTime()
-//
-//  private val sampleStats = sampleDF
-//    .filter(
-//      col("tip_amount").isNotNull &&
-//        col("fare_amount").isNotNull &&
-//        col("trip_distance").isNotNull &&
-//        col("tip_amount") >= 0 &&
-//        col("fare_amount") >= 0 &&
-//        col("trip_distance") >= 0
-//    )
-//    .select("tip_amount", "fare_amount", "trip_distance")
-//
-//  private val sampleA = sampleStats.alias("a")
-//  private val sampleB = sampleStats.alias("b")
-//
-//  private val dominationSampleCondition =
-//    (col("b.tip_amount") >= col("a.tip_amount")) &&
-//      (col("b.fare_amount") >= col("a.fare_amount")) &&
-//      (col("b.trip_distance") >= col("a.trip_distance")) &&
-//      (
-//        col("b.tip_amount") > col("a.tip_amount") ||
-//          col("b.fare_amount") > col("a.fare_amount") ||
-//          col("b.trip_distance") > col("a.trip_distance")
-//        )
-//
-//  private val skylineSampleDF = sampleA.join(sampleB, dominationSampleCondition, "left_anti")
-//
-//  private val endSkylineSample = System.nanoTime()
-//  private val durationSkylineSample = (endSkylineSample - startSkylineSample) / 1e9d
-//
-//  skylineSampleDF.show(truncate = false)
-//  println(f"Query 3 (Skyline - Sample) executed in $durationSkylineSample%.2f seconds")
-//  println(s"Skyline size (sample): ${skylineSampleDF.count()} rows")
+    val paymentTypeDF = taxiDF
+      .withColumn("payment_type_desc", toPaymentType(col("payment_type")))
+      .groupBy("payment_type_desc")
+      .agg(count("*").alias("exact_trip_count"))
+      .orderBy(desc("exact_trip_count"))
+    paymentTypeDF.show(false)
 
-  //Query4: Congestion Surcharge Trends – Analyze total congestion fees per month.
-  //No sample
-//  private val startQ4Full = System.nanoTime()
-//
-//  private val query4FullDF = taxiDF
-//    .withColumn("year", year(col("pickup_datetime")))
-//    .withColumn("month", month(col("pickup_datetime")))
-//    .groupBy("year", "month")
-//    .agg(
-//      round(sum("congestion_surcharge"), 2).alias("total_congestion_surcharge"),
-//      count("*").alias("trip_count")
-//    )
-//    .orderBy("year", "month")
-//
-//  private val endQ4Full = System.nanoTime()
-//  private val durationFull = (endQ4Full - startQ4Full) / 1e9
-//
-//  query4FullDF.show(50, truncate = false)
-//  println(f"Query 4 (Full Data) executed in $durationFull%.2f seconds")
-//
-//  //With sample
-//  private val startQ4Sample = System.nanoTime()
-//
-//  private val query4SampleDF = sampleDF
-//    .withColumn("year", year(col("pickup_datetime")))
-//    .withColumn("month", month(col("pickup_datetime")))
-//    .groupBy("year", "month")
-//    .agg(
-//      round(sum("congestion_surcharge"), 2).alias("total_congestion_surcharge"),
-//      count("*").alias("trip_count")
-//    )
-//    .orderBy("year", "month")
-//
-//  private val endQ4Sample = System.nanoTime()
-//  private val durationSample = (endQ4Sample - startQ4Sample) / 1e9
-//
-//  query4SampleDF.show(50, truncate = false)
-//  println(f"Query 4 (Sample Data) executed in $durationSample%.2f seconds")
+    // B. Reservoir Sample Estimate
+    println("--- B. Reservoir Sample Estimate ---")
+    val scalingFactor = totalRows.toDouble / sampleSize
+    val sampledPaymentTypeDF = sampleDF
+      .withColumn("payment_type_desc", toPaymentType(col("payment_type")))
+      .groupBy("payment_type_desc")
+      .agg(round(count("*") * scalingFactor).alias("sampled_trip_count"))
+      .orderBy(desc("sampled_trip_count"))
+    sampledPaymentTypeDF.show(false)
 
-  //
+    // C. Count-Min Sketch Estimate
+    println("--- C. Count-Min Sketch Estimate ---")
+    val cmsPaymentType = CountMinSketch.create(eps, confidence, seed)
+    val paymentTypeData = taxiDF.select("payment_type").collect().map(_.getString(0))
+    paymentTypeData.foreach(pt => cmsPaymentType.add(pt))
+    println("Count-Min Sketch for payment_type created.")
 
-  // Query5: Display the top 50 weekday morning dropoff locations
-  // No sample version
-  private val startQ5 = System.nanoTime()
-
-  private val query5FullDF = taxiDF
-    .withColumn("hour", hour(col("dropoff_datetime")))
-    .withColumn("day_of_week", expr("extract(DOW from dropoff_datetime) + 1")) // 1=Monday, ..., 7=Sunday
-    .filter(col("hour").between(6, 11))
-    .filter(col("day_of_week").between(1, 5)) // Weekdays only
-    .filter(col("DOLocationID").isNotNull)
-    .groupBy("DOLocationID", "hour")
-    .agg(count("*").alias("dropoff_count"))
-    .orderBy(desc("dropoff_count"))
-    .limit(50)
-
-  private val endQ5 = System.nanoTime()
-  private val durationQ5 = (endQ5 - startQ5) / 1e9
-  query5FullDF.show(false)
-  println(f"Query 5 (Weekday Morning Drop-Offs - Full Data) executed in $durationQ5%.2f seconds")
-
-  //with sample
-  private val startQ5Sample = System.nanoTime()
-
-  private val query5SampleDF = sampleDF
-    .withColumn("hour", hour(col("dropoff_datetime")))
-    .withColumn("day_of_week", expr("extract(DOW from dropoff_datetime) + 1")) // 1=Monday, ..., 7=Sunday
-    .filter(col("hour").between(6, 11))
-    .filter(col("day_of_week").between(1, 5))
-    .filter(col("DOLocationID").isNotNull)
-    .groupBy("DOLocationID", "hour")
-    .agg(count("*").alias("dropoff_count"))
-    .orderBy(desc("dropoff_count"))
-    .limit(50)
-
-  private val endQ5Sample = System.nanoTime()
-  private val durationQ5Sample = (endQ5Sample - startQ5Sample) / 1e9
-  query5SampleDF.show(false)
-  println(f"Query 5 (Weekday Morning Drop-Offs - Sample Data) executed in $durationQ5Sample%.2f seconds")
-
+    val paymentTypes = paymentTypeDF.select("payment_type_desc").collect().map(_.getString(0))
+    val paymentTypeIds = paymentTypeMapping.filter { case (_, v) => paymentTypes.contains(v) }.keys.toSeq
+    val cmsPaymentEstimates = paymentTypeIds.map(id => (paymentTypeMapping.getOrElse(id, "Other"), cmsPaymentType.estimateCount(id)))
+    val cmsPaymentDF = spark.createDataFrame(cmsPaymentEstimates).toDF("payment_type_desc", "cms_estimated_count")
+    cmsPaymentDF.show(false)
+  })
 
   spark.stop()
 }
+
