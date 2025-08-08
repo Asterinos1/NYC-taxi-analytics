@@ -3,6 +3,7 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 import org.apache.spark.util.sketch.CountMinSketch
+import org.apache.spark.sql.Row
 
 object Main extends App {
 
@@ -51,7 +52,7 @@ object Main extends App {
     .filter(
       col("pickup_datetime").between("2021-01-01", "2023-12-31")
     )
-    .limit(55000000)
+    .limit(65000000)
     .cache() // Cache the base DataFrame for performance
 
   val totalRows = taxiDF.count()
@@ -74,17 +75,32 @@ object Main extends App {
   val confidence = 0.95
   val seed = 1
 
-  // Create and populate a sketch for PULocationID
-  val cmsPuLocation = CountMinSketch.create(eps, confidence, seed)
-  val puLocationData = taxiDF.select("PULocationID").collect().map(_.getString(0))
-  puLocationData.foreach(loc => cmsPuLocation.add(loc))
+  // 1. Create and populate a sketch for PULocationID
+  val cmsPuLocation = taxiDF.select("PULocationID").rdd.mapPartitions { partition: Iterator[Row] =>
+    // Create a new, empty sketch on each executor for each partition
+    val localCms = CountMinSketch.create(eps, confidence, seed)
+    // Populate the local sketch with data from its partition
+    partition.foreach(row => localCms.add(row.getString(0)))
+    // Return the populated local sketch
+    Iterator(localCms)
+  }.reduce((cms1, cms2) => {
+    // Merge the partial sketches together in a distributed tree-reduce
+    cms1.mergeInPlace(cms2)
+    cms1
+  })
   println("Count-Min Sketch for PULocationID created.")
 
-  // Create and populate a sketch for passenger_count
-  val cmsPassengerCount = CountMinSketch.create(eps, confidence, seed)
-  val passengerCountData = taxiDF.select("passenger_count").collect().map(row => row.getDouble(0).toLong)
-  passengerCountData.foreach(pc => cmsPassengerCount.add(pc))
+  // 2. Create and populate a sketch for passenger_count
+  val cmsPassengerCount = taxiDF.select("passenger_count").rdd.mapPartitions { partition: Iterator[Row] =>
+    val localCms = CountMinSketch.create(eps, confidence, seed)
+    partition.foreach(row => localCms.add(row.getDouble(0).toLong))
+    Iterator(localCms)
+  }.reduce((cms1, cms2) => {
+    cms1.mergeInPlace(cms2)
+    cms1
+  })
   println("Count-Min Sketch for passenger_count created.")
+
 
 
   // --- Helper Function for Displaying Results ---
