@@ -11,7 +11,7 @@ object Main extends App {
     .appName("NYC Taxi Analyzer")
     .getOrCreate()
 
-  spark.sparkContext.setLogLevel("WARN") // Reduces console noise
+  spark.sparkContext.setLogLevel("ERROR") // Reduces console noise
 
   // Data for 2021-2023 period (9 GB)
   private val taxiRawDataPath = "hdfs://localhost:9000/taxi_data/yellow_taxi_combined_2021_2023.csv"
@@ -51,7 +51,7 @@ object Main extends App {
     .filter(
       col("pickup_datetime").between("2021-01-01", "2023-12-31")
     )
-    .limit(35000000)
+    .limit(55000000)
     .cache() // Cache the base DataFrame for performance
 
   val totalRows = taxiDF.count()
