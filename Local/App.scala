@@ -295,6 +295,54 @@ object Main extends App {
     cmsPaymentDF.show(false)
   })
 
+  // =================================================================================
+  // QUERY 6: Top 10 Most Frequent Tip Amounts
+  // =================================================================================
+  runAndDisplay("Query 6: Top 10 Most Frequent Tip Amounts", () => {
+    // A. Exact Calculation
+    println("--- A. Exact Calculation (Full Data) ---")
+    val exactTipsDF = taxiDF
+      .filter(col("tip_amount") > 0)
+      .groupBy("tip_amount")
+      .agg(count("*").alias("exact_trip_count"))
+      .orderBy(desc("exact_trip_count"))
+      .limit(10)
+    exactTipsDF.show(false)
+
+    // B. Reservoir Sample Estimate
+    println("--- B. Reservoir Sample Estimate ---")
+    val scalingFactor = totalRows.toDouble / sampleSize
+    val sampledTipsDF = sampleDF
+      .filter(col("tip_amount") > 0)
+      .groupBy("tip_amount")
+      .agg(round(count("*") * scalingFactor).alias("sampled_trip_count"))
+      .orderBy(desc("sampled_trip_count"))
+      .limit(10)
+    sampledTipsDF.show(false)
+
+    // C. Count-Min Sketch Estimate
+    println("--- C. Count-Min Sketch Estimate ---")
+
+    // Create a Count-Min Sketch specifically for tip amounts
+    val cmsTipAmount = taxiDF
+      .filter(col("tip_amount").isNotNull && col("tip_amount") > 0)
+      .select("tip_amount").rdd.mapPartitions { partition: Iterator[Row] =>
+        val localCms = CountMinSketch.create(eps, confidence, seed)
+        partition.foreach(row => localCms.add(row.getDouble(0).toString))
+        Iterator(localCms)
+      }.reduce((cms1, cms2) => {
+        cms1.mergeInPlace(cms2)
+        cms1
+      })
+    println("Count-Min Sketch for tip_amount created.")
+
+    // Find the top 10 from the exact calculation to query the sketch
+    val top10Tips = exactTipsDF.select("tip_amount").collect().map(_.getDouble(0))
+    val cmsEstimates = top10Tips.map(tip => (tip, cmsTipAmount.estimateCount(tip.toString)))
+    val cmsTipsDF = spark.createDataFrame(cmsEstimates).toDF("tip_amount", "cms_estimated_count")
+    cmsTipsDF.show(false)
+  })
+
   spark.stop()
 }
 
