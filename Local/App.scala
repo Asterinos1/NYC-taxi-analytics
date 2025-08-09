@@ -16,7 +16,7 @@ object Main extends App {
   private val taxiRawDataPath = "hdfs://localhost:9000/taxi_data/yellow_taxi_combined_2021_2023.csv"
   private val targetSampleSize = 100000L // desired reservoir sample size
 
-  // CMS params (epsilon, confidence)
+  //  CMS params (epsilon, confidence)
   val eps = 0.0001
   val confidence = 0.95
   val cmsSeed = 1
