@@ -16,7 +16,7 @@ object Main extends App {
   private val taxiRawDataPath = "hdfs://localhost:9000/taxi_data/yellow_taxi_combined_2021_2023.csv"
   private val targetSampleSize = 100000L // desired reservoir sample size
 
-  //  CMS params (epsilon, confidence)
+  // CMS params (epsilon, confidence)
   val eps = 0.0001
   val confidence = 0.95
   val cmsSeed = 1
@@ -218,8 +218,15 @@ object Main extends App {
     sampledPassengerCountDF.show(false)
 
     println("--- C. Count-Min Sketch Estimate ---")
-    val passengerKeys = passengerCountDF.select("passenger_count").collect().map(r => r.getDouble(0).toInt.toString)
-    val cmsPassenger = buildCmsForKey(taxi, "cast(passenger_count as string)")
+    // --- C. Count-Min Sketch Estimate (Corrected) ---
+    // First, create the keys from the exact DataFrame.
+    val passengerKeys = passengerCountDF.select("passenger_count").collect().map(r => r.getDouble(0).toString)
+
+    // Build CMS on a new DataFrame that explicitly casts passenger_count to a string
+    val cmsInputDF = taxi.withColumn("passenger_count_string", col("passenger_count").cast(StringType))
+    val cmsPassenger = buildCmsForKey(cmsInputDF, "passenger_count_string")
+
+    // Now, query the CMS with the same string keys
     val cmsPassengerEst = estimateForKeys(cmsPassenger, passengerKeys)
     cmsPassengerEst.toSeq.toDF("passenger_count", "cms_estimated_count").show(false)
   }
