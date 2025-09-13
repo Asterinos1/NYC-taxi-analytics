@@ -48,6 +48,6 @@ The evaluation shows that while Reservoir Sampling provides a reasonable approxi
 ##  How to Run
 
 1.  **Prerequisites:** Ensure you have Apache Spark and Hadoop (with HDFS) installed and configured locally.
-2.  **Dataset:** Download the NYC Yellow Taxi data for 2021-2023 and place it in your HDFS at the path specified in the code. (Note: You must modify combine the data into a single csv file)
+2.  **Dataset:** Download the NYC Yellow Taxi data for 2021-2023 and place it in your HDFS at the path specified in the code. (Note: You must combine the data into a single csv file)
 3.  **Build:** Use `sbt` to build the project.
 4.  **Run:** Execute the main application class `Main` to run the analysis. The results will be printed to the console.
